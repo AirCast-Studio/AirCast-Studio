@@ -1,0 +1,132 @@
+diff --git a/cmake/common/versionconfig.cmake b/cmake/common/versionconfig.cmake
+index 7a1e753..c042af8 100644
+--- a/cmake/common/versionconfig.cmake
++++ b/cmake/common/versionconfig.cmake
+@@ -20,8 +20,10 @@ if(NOT DEFINED OBS_VERSION_OVERRIDE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git
+     message(FATAL_ERROR "Could not fetch OBS version tag from git.\n" ${_git_describe_err})
+   endif()
+ 
+-  if(_obs_version_result EQUAL 0)
++  if(_obs_version_result EQUAL 0 AND _obs_version MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+).*")
+     string(REGEX REPLACE "([0-9]+)\\.([0-9]+)\\.([0-9]+).*" "\\1;\\2;\\3" _obs_version_canonical ${_obs_version})
++  else()
++    set(_obs_version "${_obs_default_version}-${_obs_version}")
+   endif()
+ elseif(DEFINED OBS_VERSION_OVERRIDE)
+   if(OBS_VERSION_OVERRIDE MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+).*")
+diff --git a/frontend/OBSApp.cpp b/frontend/OBSApp.cpp
+index 6ade93c..a84c439 100644
+--- a/frontend/OBSApp.cpp
++++ b/frontend/OBSApp.cpp
+@@ -81,6 +81,8 @@ extern "C" __declspec(dllexport) DWORD NvOptimusEnablement = 1;
+ extern "C" __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+ #endif
+ 
++extern bool opt_aircast_engine;
++
+ namespace {
+ 
+ typedef struct UncleanLaunchAction {
+@@ -441,6 +443,18 @@ static bool MakeUserDirs()
+ 	if (!do_mkdir(path))
+ 		return false;
+ 
++	if (opt_aircast_engine &&
++	    GetAppConfigPath(path, sizeof(path), "obs-studio/plugin_config/obs-websocket") > 0 &&
++	    do_mkdir(path)) {
++		string cfgPath = string(path) + "/config.json";
++		OBSDataAutoRelease wsCfg = obs_data_create_from_json_file(cfgPath.c_str());
++		if (!wsCfg)
++			wsCfg = obs_data_create();
++		obs_data_set_bool(wsCfg, "first_load", false);
++		obs_data_set_bool(wsCfg, "server_enabled", true);
++		obs_data_save_json_safe(wsCfg, cfgPath.c_str(), "tmp", "bak");
++	}
++
+ 	return true;
+ }
+ 
+@@ -1105,7 +1119,7 @@ void OBSApp::checkForUncleanShutdown()
+ 	bool hasUncleanShutdown = crashHandler_->hasUncleanShutdown();
+ 	bool hasNewCrashLog = crashHandler_->hasNewCrashLog();
+ 
+-	if (hasUncleanShutdown) {
++	if (hasUncleanShutdown && !opt_aircast_engine) { // a hidden engine can't answer the safe-mode prompt
+ 		UncleanLaunchAction launchAction = handleUncleanShutdown(hasNewCrashLog);
+ 
+ 		safe_mode = launchAction.useSafeMode;
+diff --git a/frontend/obs-main.cpp b/frontend/obs-main.cpp
+index 9360105..180d3f6 100644
+--- a/frontend/obs-main.cpp
++++ b/frontend/obs-main.cpp
+@@ -70,6 +70,7 @@ bool opt_studio_mode = false;
+ bool opt_start_replaybuffer = false;
+ bool opt_start_virtualcam = false;
+ bool opt_minimize_tray = false;
++bool opt_aircast_engine = false; // AirCast: no window, tray, wizard or safe-mode prompt; driven over obs-websocket
+ bool opt_allow_opengl = false;
+ bool opt_always_on_top = false;
+ bool opt_disable_updater = false;
+@@ -974,6 +975,9 @@ int main(int argc, char *argv[])
+ 			if (++i < argc)
+ 				opt_starting_scene = argv[i];
+ 
++		} else if (arg_is(argv[i], "--aircast-engine", nullptr)) {
++			opt_aircast_engine = true;
++
+ 		} else if (arg_is(argv[i], "--minimize-to-tray", nullptr)) {
+ 			opt_minimize_tray = true;
+ 
+diff --git a/frontend/widgets/OBSBasic.cpp b/frontend/widgets/OBSBasic.cpp
+index e3277eb..b735496 100644
+--- a/frontend/widgets/OBSBasic.cpp
++++ b/frontend/widgets/OBSBasic.cpp
+@@ -80,6 +80,7 @@ extern bool disable_3p_plugins;
+ extern bool opt_studio_mode;
+ extern bool opt_always_on_top;
+ extern bool opt_minimize_tray;
++extern bool opt_aircast_engine;
+ extern std::string opt_starting_profile;
+ extern std::string opt_starting_collection;
+ 
+@@ -1150,8 +1151,8 @@ void OBSBasic::OBSInit()
+ 	 * or neither the setting nor flag for starting minimized is set. */
+ 	bool sysTrayEnabled = config_get_bool(App()->GetUserConfig(), "BasicWindow", "SysTrayEnabled");
+ 	bool sysTrayWhenStarted = config_get_bool(App()->GetUserConfig(), "BasicWindow", "SysTrayWhenStarted");
+-	bool hideWindowOnStart = QSystemTrayIcon::isSystemTrayAvailable() && sysTrayEnabled &&
+-				 (opt_minimize_tray || sysTrayWhenStarted);
++	bool hideWindowOnStart = opt_aircast_engine || (QSystemTrayIcon::isSystemTrayAvailable() && sysTrayEnabled &&
++						       (opt_minimize_tray || sysTrayWhenStarted));
+ 
+ #ifdef _WIN32
+ 	SetWin32DropStyle(this);
+@@ -1265,7 +1266,7 @@ void OBSBasic::OBSInit()
+ 		config_save_safe(App()->GetUserConfig(), "tmp", nullptr);
+ 	}
+ 
+-	if (!first_run && !has_last_version && !Active())
++	if (!first_run && !has_last_version && !Active() && !opt_aircast_engine)
+ 		QMetaObject::invokeMethod(this, "on_autoConfigure_triggered", Qt::QueuedConnection);
+ 
+ #if (defined(_WIN32) || defined(__APPLE__)) && (OBS_RELEASE_CANDIDATE > 0 || OBS_BETA > 0)
+diff --git a/frontend/widgets/OBSBasic_SysTray.cpp b/frontend/widgets/OBSBasic_SysTray.cpp
+index d1cb58e..c0650d6 100644
+--- a/frontend/widgets/OBSBasic_SysTray.cpp
++++ b/frontend/widgets/OBSBasic_SysTray.cpp
+@@ -20,6 +20,7 @@
+ #include "OBSBasic.hpp"
+ 
+ extern bool opt_minimize_tray;
++extern bool opt_aircast_engine;
+ 
+ void OBSBasic::SystemTrayInit()
+ {
+@@ -117,7 +118,7 @@ void OBSBasic::SystemTray(bool firstStarted)
+ 	if (firstStarted)
+ 		SystemTrayInit();
+ 
+-	if (!sysTrayEnabled) {
++	if (!sysTrayEnabled || opt_aircast_engine) {
+ 		trayIcon->hide();
+ 	} else {
+ 		trayIcon->show();
